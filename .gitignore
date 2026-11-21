@@ -1,0 +1,29 @@
+# 依赖与可重新生成的构建产物
+node_modules/
+/frontend/dist/
+/build/bin/
+/dist/
+/resource_windows_*.syso
+*.exe
+*.tsbuildinfo
+/coverage/
+*.log
+
+# 本机环境文件（保留可公开的模板）
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# 编辑器和系统文件
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 便携运行数据与发布包
+DevEnvManagerData/
+/DevEnvManager-*.zip

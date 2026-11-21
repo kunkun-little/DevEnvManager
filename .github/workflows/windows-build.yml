@@ -1,0 +1,46 @@
+name: Windows x64 build and smoke test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend and Windows x64 app
+        shell: bash
+        run: bash scripts/build.sh
+      - name: Go tests and vet
+        shell: bash
+        run: |
+          go test -buildvcs=false ./...
+          go vet ./...
+      - name: Verify executable starts and closes
+        shell: bash
+        run: go run ./cmd/window-smoke -exe dist/DevEnvManager.exe -title 开发环境管家 -exact -timeout 45s
+      - name: Pack executable and checksum
+        shell: pwsh
+        run: |
+          $files = @('dist/DevEnvManager.exe', 'README.md', 'TEST-REPORT.md', 'licenses')
+          Compress-Archive -Path $files -DestinationPath 'dist/DevEnvManager-0.3.0-windows-x64.zip'
+          $paths = @('dist/DevEnvManager.exe', 'dist/DevEnvManager-0.3.0-windows-x64.zip')
+          $paths | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $_)
+          } | Set-Content -Encoding ascii dist/DevEnvManager-0.3.0-SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DevEnvManager-Windows-x64
+          path: |
+            dist/DevEnvManager-0.3.0-windows-x64.zip
+            dist/DevEnvManager-0.3.0-SHA256.txt
+          if-no-files-found: error
