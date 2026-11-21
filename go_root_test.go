@@ -13,7 +13,7 @@ func TestGoBatchSelection(t *testing.T) {
 	if e != nil || !reflect.DeepEqual(got, []string{"go-temp", "go-cache"}) {
 		t.Fatalf("%v: %v", got, e)
 	}
-	for _, ids := range [][]string{nil, {"go-temp", "go-temp"}, {"go-path"}, {"../../go-temp"}} {
+	for _, ids := range [][]string{nil, {"go-temp", "go-temp"}, {"go-root"}, {"../../go-temp"}} {
 		if _, e := expandGoSelection(ids); e == nil {
 			t.Fatalf("accepted %v", ids)
 		}

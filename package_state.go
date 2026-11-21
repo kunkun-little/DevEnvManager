@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type PackageState struct {
@@ -15,6 +16,7 @@ type PackageState struct {
 	Error      string `json:"error"`
 }
 
+var packageVersion = regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+`)
 var wingetVersionText = regexp.MustCompile(`^v?[0-9][0-9a-zA-Z._+-]*$`)
 
 func parseExactWinGetEntry(output, id string) (bool, string) {
@@ -48,7 +50,8 @@ func (a *App) DetectPackage(id string) PackageState {
 	if e != nil {
 		return PackageState{Error: "未发现 WinGet"}
 	}
-	return detectPackageWithExe(i, exe)
+	_, s := matchPackage(a.activePackage(i), exe)
+	return s
 }
 
 func detectPackageWithExe(i item, exe string) PackageState {
@@ -91,4 +94,28 @@ func gatePackageAction(verb string, state PackageState) error {
 		return errors.New("未匹配到该精确包，不执行更新或卸载")
 	}
 	return nil
+}
+
+func matchPackage(i item, exe string) (item, PackageState) {
+	s := detectPackageWithExe(i, exe)
+	active := ""
+	if s.Registered && i.row.Command != "" {
+		if wd, e := workdir(""); e == nil {
+			v, _, _ := probe(i.row.Command, wd, 8*time.Second)
+			active = packageVersion.FindString(v)
+		}
+	}
+	mismatch := s.Registered && active != "" && active != s.Version
+	if i.row.ID == "node-version" && (!s.Registered || mismatch) && s.Error == "" {
+		other := i
+		other.row.PackageID = "OpenJS.NodeJS"
+		alt := detectPackageWithExe(other, exe)
+		if alt.Registered && (active == "" || alt.Version == active) {
+			return other, alt
+		}
+	}
+	if mismatch {
+		s.Error = "WinGet 登记版本与当前运行版本不同，请通过当前安装渠道维护"
+	}
+	return i, s
 }

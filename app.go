@@ -17,7 +17,14 @@ import (
 	"time"
 )
 
+type configRegistry struct {
+	read   func(bool, string) (prior, error)
+	write  func(string, prior) error
+	notify func()
+}
+
 type App struct {
+	registry       configRegistry
 	mu             sync.Mutex
 	pending        map[string]request
 	ctxMu          sync.RWMutex
@@ -25,7 +32,9 @@ type App struct {
 	packageRunning bool
 }
 
-func NewApp() *App { return &App{pending: make(map[string]request)} }
+func NewApp() *App {
+	return &App{pending: make(map[string]request), registry: configRegistry{regValue, regSetRaw, notifyEnv}}
+}
 func (a *App) startup(ctx context.Context) {
 	a.ctxMu.Lock()
 	a.ctx = ctx
@@ -44,20 +53,31 @@ type Row struct {
 	PackageID   string `json:"packageID"`
 }
 type Snapshot struct {
-	Value      string `json:"value"`
-	Path       string `json:"path"`
-	User       string `json:"user"`
-	Machine    string `json:"machine"`
-	Inherited  string `json:"inherited"`
-	SizeBytes  int64  `json:"sizeBytes"`
-	SizeStatus string `json:"sizeStatus"`
-	Error      string `json:"error"`
+	SettingVariable   string `json:"settingVariable,omitempty"`
+	RegisteredVersion string `json:"registeredVersion"`
+	Rollback          bool   `json:"rollback"`
+	Value             string `json:"value"`
+	Path              string `json:"path"`
+	User              string `json:"user"`
+	Machine           string `json:"machine"`
+	Inherited         string `json:"inherited"`
+	SizeBytes         int64  `json:"sizeBytes"`
+	SizeStatus        string `json:"sizeStatus"`
+	Error             string `json:"error"`
 }
+type DirectoryPreview struct {
+	Label    string `json:"label"`
+	Variable string `json:"variable"`
+	Current  string `json:"current"`
+	Target   string `json:"target"`
+}
+
 type Plan struct {
-	Token   string   `json:"token"`
-	Summary string   `json:"summary"`
-	Lines   []string `json:"lines"`
-	Error   string   `json:"error"`
+	Directories []DirectoryPreview `json:"directories,omitempty"`
+	Token       string             `json:"token"`
+	Summary     string             `json:"summary"`
+	Lines       []string           `json:"lines"`
+	Error       string             `json:"error"`
 }
 type Result struct {
 	Message string `json:"message"`
@@ -78,31 +98,31 @@ const pipDocs = "https://pip.pypa.io/en/stable/cli/pip_cache/"
 const pnpmDocs = "https://pnpm.io/settings"
 
 var items = []item{
-	spec("node-version", "Node.js", "版本", "node --version", "", "", "当前 PATH 选中的版本；安装管理仅匹配 Node.js LTS。", "https://nodejs.org/en/download/", "OpenJS.NodeJS.LTS", false),
+	spec("node-version", "Node.js", "版本", "node --version", "", "", "当前 PATH 选中的版本；安装管理核对 WinGet 登记的 Node.js LTS 或正式版。", "https://nodejs.org/en/download/", "OpenJS.NodeJS.LTS", false),
 	spec("node-exe", "Node.js", "运行路径", "node -p process.execPath", "", "", "Node 实际启动路径；不会通过变量迁移现有安装。", "https://nodejs.org/api/process.html#processexecpath", "", false),
-	spec("node-cache", "Node.js", "JS 编译缓存", "", "NODE_COMPILE_CACHE", "", "Node 22.1+ 才支持。设置会启用编译缓存并指定位置；不搬旧文件。重启 Node 进程。", "https://nodejs.org/api/cli.html#node_compile_cachedir", "", true),
+	spec("node-cache", "Node.js", "JS 编译缓存", "", "NODE_COMPILE_CACHE", "", "Node 22.1+ 才支持。设置会启用编译缓存并指定位置。重启 Node 进程。", "https://nodejs.org/api/cli.html#node_compile_cachedir", "", true),
 	spec("npm-version", "npm", "版本", "npm --version", "", "", "当前 PATH 中 npm 入口的版本。通常随 Node.js 安装。", "https://docs.npmjs.com/cli/", "", false),
 	spec("npm-cache", "npm", "下载缓存", "npm config get cache", "NPM_CONFIG_CACHE", "npm cache clean --force", "项目或进程配置可能覆盖用户值。清后离线安装可能缺包。", "https://docs.npmjs.com/cli/cache/", "", true, "_cacache"),
-	spec("npm-prefix", "npm", "全局前缀", "npm config get prefix", "", "", "全局包和命令安装位置，不是缓存；迁移需另评估 PATH 和重装。", "https://docs.npmjs.com/cli/using-npm/config#prefix", "", false),
+	spec("npm-prefix", "npm", "全局前缀", "npm config get prefix", "NPM_CONFIG_PREFIX", "", "全局包及命令入口的安装目录。切换后要核对 PATH 中的旧前缀和全局命令。", "https://docs.npmjs.com/cli/using-npm/config#prefix", "", false),
 	spec("npm-config", "npm", "用户 npmrc", "npm config get userconfig", "", "", "仅报告配置文件路径，不读写配置及凭据。", "https://docs.npmjs.com/cli/using-npm/config#userconfig", "", false),
-	spec("pnpm-version", "pnpm", "版本", "pnpm --version", "", "", "Corepack 模式仅用已存在的本地包；本工具不接管包管理器安装归属。", "https://pnpm.io/installation", "", false),
-	spec("pnpm-store", "pnpm", "共享 store", "pnpm store path", "", "pnpm store prune", "路径随项目和驱动器变化；跨盘不能硬链接。prune 仅删除 pnpm 判定的未引用内容。配置保留只读，避免各大版本配置源差异。", "https://pnpm.io/cli/store", "", true, "files"),
-	spec("pnpm-cache", "pnpm", "元数据缓存设置", "pnpm config get cache-dir", "", "", "这是 CLI 的配置读取值，不是默认路径推断；undefined 不代表没有缓存。", pnpmDocs, "", true),
-	spec("pnpm-state", "pnpm", "状态目录设置", "pnpm config get state-dir", "", "", "工具状态不当成缓存清理。", pnpmDocs, "", false),
-	spec("pnpm-global", "pnpm", "全局包目录设置", "pnpm config get global-dir", "", "", "全局包目录（非缓存）。", pnpmDocs, "", false),
-	spec("python-version", "Python", "解释器版本", "python --version", "", "", "反映当前用户 PATH / 虚拟环境；WinGet 仅匹配 Python 3.13。", "https://docs.python.org/3/using/windows.html", "Python.Python.3.13", false),
+	spec("pnpm-version", "pnpm", "版本", "pnpm --version", "", "", "Corepack 模式仅用已存在的本地包；维护前核对 npm 全局安装或 WinGet 包。", "https://pnpm.io/installation", "pnpm.pnpm", false),
+	spec("pnpm-store", "pnpm", "共享包存储根目录", "pnpm config get store-dir", "NPM_CONFIG_STORE_DIR", "pnpm store prune", "填写存储根目录。pnpm 在其中管理 v10 等版本子目录；既有项目切换存储后可能需要重新安装依赖。", "https://pnpm.io/cli/store", "", true, "files"),
+	spec("pnpm-cache", "pnpm", "元数据缓存设置", "pnpm config get cache-dir", "NPM_CONFIG_CACHE_DIR", "", "显示 cache-dir 配置值。未设置时，pnpm 使用该版本的默认缓存位置。", pnpmDocs, "", true),
+	spec("pnpm-state", "pnpm", "状态目录设置", "pnpm config get state-dir", "NPM_CONFIG_STATE_DIR", "", "工具状态不当成缓存清理。", pnpmDocs, "", false),
+	spec("pnpm-global", "pnpm", "全局包目录设置", "pnpm config get global-dir", "NPM_CONFIG_GLOBAL_DIR", "", "全局包目录。旧包可能引用原位置，切换后请核对全局包与命令。", pnpmDocs, "", false),
+	spec("python-version", "Python", "解释器版本", "python --version", "", "", "反映当前用户 PATH / 虚拟环境；WinGet 按当前解释器的主次版本匹配。", "https://docs.python.org/3/using/windows.html", "Python.Python.3.13", false),
 	spec("python-pip", "Python", "pip 版本", "python -I -B -m pip --version", "", "", "隔离模式忽略用户 site-packages；如果 pip 仅安装在那里，本项可能不可见。", pipDocs, "", false),
 	spec("pip-cache", "Python", "pip 下载及轮子缓存", "python -I -B -m pip cache dir", "PIP_CACHE_DIR", "python -I -B -m pip cache purge", "清理下载和 wheel 缓存，可能需重新下载或构建。", pipDocs, "", true, "http", "http-v2", "wheels"),
 	spec("python-user", "Python", "用户包基目录", "python -I -B -m site --user-base", "", "", "属于安装路径，不应当作缓存。隔离查询可能与项目会话不同。", "https://docs.python.org/3/library/site.html", "", false),
-	spec("python-pycache", "Python", "字节码缓存前缀", "", "PYTHONPYCACHEPREFIX", "", "不搬迁既有 __pycache__；解释器重开生效，-E/-I 可忽略。", "https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPYCACHEPREFIX", "", true),
+	spec("python-pycache", "Python", "字节码缓存前缀", "", "PYTHONPYCACHEPREFIX", "", "仅处理已配置的集中缓存目录。解释器重开生效，-E/-I 可忽略。", "https://docs.python.org/3/using/cmdline.html#envvar-PYTHONPYCACHEPREFIX", "", true),
 	spec("go-version", "Go", "版本", "go version", "", "", "探测强制使用本地 Go 版本，不下载被项目指定的工具链。", "https://go.dev/doc/toolchain", "GoLang.Go", false),
 	spec("go-cache", "Go", "构建缓存", "go env GOCACHE", "GOCACHE", "go clean -cache", "可重建的编译结果；清理后首次构建变慢。", goDocs, "", true),
-	spec("go-mod", "Go", "模块缓存", "go env GOMODCACHE", "GOMODCACHE", "", "模块、离线依赖和下载的工具链；不会清理。改目录后可能要重新下载。", goDocs, "", true),
+	spec("go-mod", "Go", "模块缓存", "go env GOMODCACHE", "GOMODCACHE", "", "包含模块、离线依赖以及下载的工具链。删除旧模块缓存后可能需要重新下载。", goDocs, "", true),
 	spec("go-temp", "Go", "构建临时工作目录", "go env GOTMPDIR", "GOTMPDIR", "", "仅影响 Go 自身构建临时目录；不会改系统 TEMP。空值表示默认临时目录。", goDocs, "", true),
-	spec("go-path", "Go", "工作区路径", "go env GOPATH", "", "", "可能有用户源码和已安装命令，不扫描或清理整个目录。", goDocs, "", false),
-	spec("go-bin", "Go", "命令安装位置", "go env GOBIN", "", "", "空值通常表示首个 GOPATH 下的 bin；非构建输出通用目录。", goDocs, "", false),
+	spec("go-path", "Go", "工作区路径", "go env GOPATH", "GOPATH", "", "GOPATH 包含工作区、已安装命令，也可能包含源码。多个工作区路径请分别核对。", goDocs, "", false),
+	spec("go-bin", "Go", "命令安装位置", "go env GOBIN", "GOBIN", "", "GOBIN 控制 go install 的命令安装位置。默认使用首个 GOPATH 下的 bin。", goDocs, "", false),
 	spec("go-file", "Go", "Go 环境配置文件", "go env GOENV", "", "", "该文件是 go env -w 写入的位置；进程环境变量优先。", goDocs, "", false),
-	spec("go-root", "Go", "工具链目录", "go env GOROOT", "", "", "工具链安装根目录，不迁移。", goDocs, "", false),
+	spec("go-root", "Go", "Go 安装目录", "go env GOROOT", "", "", "当前运行的 Go 工具链根目录（GOROOT）。通过安装器或版本管理器维护。", goDocs, "", false),
 }
 
 func byID(id string) (item, error) {
@@ -303,7 +323,59 @@ func (a *App) Inspect(id, cwd string) Snapshot {
 		s.Error = e.Error()
 		return s
 	}
+	if i.row.Tool == "pnpm" && i.row.Variable != "" {
+		wd, err := workdir(cwd)
+		if err != nil {
+			return Snapshot{Error: err.Error()}
+		}
+		version, _, err := probe("pnpm --version", wd, 8*time.Second)
+		if err != nil {
+			return Snapshot{Error: err.Error()}
+		}
+		i, err = pnpmDirectoryItem(i, version)
+		if err != nil {
+			return Snapshot{Error: err.Error()}
+		}
+	}
+	return inspectItem(i, cwd)
+}
+func inspectItem(i item, cwd string) Snapshot {
+	s := readVariables(i)
+	s.SettingVariable = i.row.Variable
+	id := i.row.ID
+	if i.row.Command != "" {
+		w, e := workdir(cwd)
+		if e != nil {
+			s.Error = e.Error()
+			return s
+		}
+		s.Value, s.Path, e = probe(i.row.Command, w, 8*time.Second)
+		if e != nil {
+			if s.Path == "" && strings.HasSuffix(id, "-version") {
+				s.RegisteredVersion = registeredVersion(id)
+			}
+			s.Error = e.Error()
+			return s
+		}
+		if i.row.Tool == "pnpm" && i.row.Variable != "" {
+			s.Value, e = packageDirectorySource(i, s.Value, w)
+			if e != nil {
+				s.Error = e.Error()
+			}
+		}
+	} else {
+		s.Value = s.Inherited
+	}
+	return withSize(i, s)
+}
+
+func readVariables(i item) Snapshot {
+	var s Snapshot
 	if i.row.Variable != "" {
+		if d, e := dataDir(false); e == nil {
+			st, e := os.Lstat(filepath.Join(d, i.row.ID+".json"))
+			s.Rollback = e == nil && st.Mode().IsRegular() && !reparse(st)
+		}
 		s.Inherited = os.Getenv(i.row.Variable)
 		v, e := regValue(false, i.row.Variable)
 		if e == nil {
@@ -314,20 +386,10 @@ func (a *App) Inspect(id, cwd string) Snapshot {
 			s.Machine = m.Value
 		}
 	}
-	if i.row.Command != "" {
-		w, e := workdir(cwd)
-		if e != nil {
-			s.Error = e.Error()
-			return s
-		}
-		s.Value, s.Path, e = probe(i.row.Command, w, 8*time.Second)
-		if e != nil {
-			s.Error = e.Error()
-			return s
-		}
-	} else {
-		s.Value = s.Inherited
-	}
+	return s
+}
+
+func withSize(i item, s Snapshot) Snapshot {
 	if i.size && s.Value != "" && s.Value != "undefined" {
 		p, e := localPath(s.Value)
 		if e != nil {
@@ -349,8 +411,9 @@ type prior struct {
 	Kind   uint32
 }
 type backup struct {
-	Old     prior
-	Applied string
+	Variable string `json:",omitempty"`
+	Old      prior
+	Applied  string
 }
 type cleanItem struct{ ID, Dir, Exe string }
 type request struct {
@@ -358,6 +421,7 @@ type request struct {
 	old                                prior
 	clean                              []cleanItem
 	goChanges                          []goChange
+	policy                             string
 	packageState                       PackageState
 	expires                            time.Time
 }
@@ -461,156 +525,6 @@ func supportsVersion(i item) error {
 	}
 	return nil
 }
-func (a *App) PlanConfig(id, target string) Plan {
-	i, e := byID(id)
-	if e != nil || i.row.Variable == "" {
-		return Plan{Error: "此项只读"}
-	}
-	if i.row.Tool == "Go" {
-		if e = goBatchIsFree(); e != nil {
-			return Plan{Error: e.Error()}
-		}
-	}
-	if e = supportsVersion(i); e != nil {
-		return Plan{Error: e.Error()}
-	}
-	if _, e = resolve(exeName(i)); e != nil {
-		return Plan{Error: e.Error()}
-	}
-	p, e := localPath(strings.TrimSpace(target))
-	if e != nil {
-		return Plan{Error: e.Error()}
-	}
-	if e = emptyTarget(p); e != nil {
-		return Plan{Error: e.Error()}
-	}
-	old, e := regValue(false, i.row.Variable)
-	if e != nil {
-		return Plan{Error: e.Error()}
-	}
-	if old.Exists && (old.Kind != 1 || old.Value == "") {
-		return Plan{Error: "现有值不是普通非空字符串，为避免破坏其类型，拒绝修改"}
-	}
-	if old.Exists && strings.EqualFold(old.Value, p) {
-		return Plan{Error: "当前用户变量已指向该路径"}
-	}
-	d, e := dataDir(false)
-	if e != nil {
-		return Plan{Error: e.Error()}
-	}
-	if _, e = os.Lstat(filepath.Join(d, id+".json")); !os.IsNotExist(e) {
-		return Plan{Error: "已有未撤销的变更记录，或无法读取其位置"}
-	}
-	prev := old.Value
-	if !old.Exists {
-		prev = "（未设置）"
-	}
-	return a.plan(request{action: "cfg", id: id, target: p, old: old}, "写入当前用户的 "+i.row.Variable, []string{"旧值：" + prev, "新值：" + p, i.row.Description, "仅改该变量；不复制、不删除原目录，也不改 PATH。重开工具、终端和 IDE 后复查，通常不需重启 Windows。"})
-}
-func (a *App) ApplyConfig(token string) Result {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	release, lockErr := holdConfigLock()
-	if lockErr != nil {
-		return asResult(lockErr, "")
-	}
-	defer release()
-
-	action := "cfg"
-	if a.pending[token].action == "cfg-go" {
-		action = "cfg-go"
-	}
-	r, e := a.take(token, action)
-	if e != nil {
-		return asResult(e, "")
-	}
-	if action == "cfg-go" {
-		return a.applyGoRoot(r)
-	}
-	i, _ := byID(r.id)
-	if i.row.Tool == "Go" {
-		if e = goBatchIsFree(); e != nil {
-			return asResult(e, "")
-		}
-	}
-	if e = supportsVersion(i); e != nil {
-		return asResult(e, "")
-	}
-	p, e := localPath(r.target)
-	if e != nil {
-		return asResult(e, "")
-	}
-	if e = emptyTarget(p); e != nil {
-		return asResult(e, "")
-	}
-	old, e := regValue(false, i.row.Variable)
-	if e != nil {
-		return asResult(e, "")
-	}
-	if old != r.old {
-		return Result{Error: "当前值已发生变化，请重新预览"}
-	}
-	d, e := dataDir(true)
-	if e != nil {
-		return asResult(e, "")
-	}
-	file := filepath.Join(d, r.id+".json")
-	f, e := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if e != nil {
-		return asResult(e, "")
-	}
-	e = json.NewEncoder(f).Encode(backup{old, p})
-	if e == nil {
-		e = f.Sync()
-	}
-	ce := f.Close()
-	if e == nil {
-		e = ce
-	}
-	if e != nil {
-		_ = os.Remove(file)
-		return asResult(e, "")
-	}
-	if e = applyRegistry(i, p, old); e != nil {
-		if v, x := regValue(false, i.row.Variable); x == nil && v == old {
-			_ = os.Remove(file)
-		}
-		return asResult(e, "")
-	}
-	return Result{Message: "已写入并保留回滚记录；原目录未更改。重开工具、终端和 IDE 后验证。"}
-}
-func applyRegistry(i item, p string, old prior) error {
-	if _, e := localPath(p); e != nil {
-		return e
-	}
-	if e := os.MkdirAll(p, 0700); e != nil {
-		return e
-	}
-	if _, e := localPath(p); e != nil {
-		return e
-	}
-	// Only touch a fresh disposable marker to verify actual write access.
-	t, e := os.CreateTemp(p, ".devenv-write-")
-	if e != nil {
-		return e
-	}
-	name := t.Name()
-	if e = t.Close(); e != nil {
-		_ = os.Remove(name)
-		return e
-	}
-	if e = os.Remove(name); e != nil {
-		return e
-	}
-	v, e := regValue(false, i.row.Variable)
-	if e != nil {
-		return e
-	}
-	if v != old {
-		return errors.New("当前用户变量已变化，未覆盖")
-	}
-	return regSet(i.row.Variable, prior{Value: p, Exists: true, Kind: 1})
-}
 func (a *App) Rollback(id string) Result {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -624,10 +538,8 @@ func (a *App) Rollback(id string) Result {
 	if e != nil || i.row.Variable == "" {
 		return Result{Error: "此项目没有可回滚的变量"}
 	}
-	if i.row.Tool == "Go" {
-		if e = goBatchIsFree(); e != nil {
-			return asResult(e, "")
-		}
+	if e = checkBatchConflict([]string{id}); e != nil {
+		return asResult(e, "")
 	}
 	d, e := dataDir(false)
 	if e != nil {
@@ -649,16 +561,21 @@ func (a *App) Rollback(id string) Result {
 	if rec.Applied == "" || (rec.Old.Exists && (rec.Old.Kind != 1 || rec.Old.Value == "")) {
 		return Result{Error: "回滚记录字段无效"}
 	}
-	cur, e := regValue(false, i.row.Variable)
+	i, e = journalItem(id, rec.Variable)
+	if e != nil {
+		return asResult(e, "")
+	}
+	cur, e := a.registry.read(false, i.row.Variable)
 	if e != nil {
 		return asResult(e, "")
 	}
 	if !cur.Exists || cur.Kind != 1 || cur.Value != rec.Applied {
 		return Result{Error: "当前值已经在外部变化，不覆盖"}
 	}
-	if e = regSet(i.row.Variable, rec.Old); e != nil {
+	if e = a.registry.write(i.row.Variable, rec.Old); e != nil {
 		return asResult(e, "")
 	}
+	a.registry.notify()
 	if e = os.Remove(p); e != nil {
 		return asResult(e, "")
 	}
@@ -669,7 +586,11 @@ func checkClean(i item, w string) (cleanItem, error) {
 	if i.row.Cleanup == "" {
 		return out, errors.New("此项不提供清理")
 	}
-	val, exe, e := probe(i.row.Command, w, 8*time.Second)
+	command := i.row.Command
+	if i.row.ID == "pnpm-store" {
+		command = "pnpm store path"
+	}
+	val, exe, e := probe(command, w, 8*time.Second)
 	if e != nil {
 		return out, e
 	}
@@ -783,6 +704,7 @@ func (a *App) ApplyCleanup(token string) Result {
 }
 func (a *App) PlanPackage(id, verb string) Plan {
 	i, e := byID(id)
+	i = a.activePackage(i)
 	if e != nil || i.row.PackageID == "" {
 		return Plan{Error: "此项没有已知安全的安装来源；请选该工具的版本项"}
 	}
@@ -798,12 +720,13 @@ func (a *App) PlanPackage(id, verb string) Plan {
 	if e != nil {
 		return Plan{Error: "未找到 WinGet。需 Windows 应用安装程序；本工具不代为安装。"}
 	}
-	args := fmt.Sprintf("%s --id %s --exact --source winget", verb, i.row.PackageID)
-	args += " --disable-interactivity"
-	lines := []string{"winget " + args}
 	var state PackageState
 	if verb != "list" {
-		state = detectPackageWithExe(i, exe)
+		i, state = matchPackage(i, exe)
+	}
+	args := fmt.Sprintf("%s --id %s --exact --source winget --disable-interactivity", verb, i.row.PackageID)
+	lines := []string{"winget " + args}
+	if verb != "list" {
 		if e = gatePackageAction(verb, state); e != nil {
 			return Plan{Error: e.Error()}
 		}
@@ -824,7 +747,7 @@ func (a *App) PlanPackage(id, verb string) Plan {
 		}
 	}
 	lines = append(lines, "精确目录匹配不证明原安装归属；更新和卸载前先核对目标。", "不自动同意软件或源协议。安装器仍可显示自己的界面或请求管理员权限。")
-	return a.plan(request{action: "pkg", id: id, verb: verb, exe: exe, packageState: state}, "运行 WinGet", lines)
+	return a.plan(request{action: "pkg", id: id, verb: verb, exe: exe, packageState: state, cwd: i.row.PackageID}, "运行 WinGet", lines)
 }
 func (a *App) ApplyPackage(token string) Result {
 	a.mu.Lock()
@@ -840,13 +763,21 @@ func (a *App) ApplyPackage(token string) Result {
 	a.packageRunning = true
 	a.mu.Unlock()
 	defer func() { a.mu.Lock(); a.packageRunning = false; a.mu.Unlock() }()
+	if r.target != "" {
+		return a.applyMaintenanceRoute(r)
+	}
 	i, _ := byID(r.id)
+	i = a.activePackage(i)
 	exe, e := resolve("winget")
 	if e != nil || exe != r.exe {
 		return Result{Error: "WinGet 命令已变化，请重试"}
 	}
 	if r.verb != "list" {
-		state := detectPackageWithExe(i, exe)
+		matched, state := matchPackage(i, exe)
+		i = matched
+		if i.row.PackageID != r.cwd {
+			return Result{Error: "安装渠道已变化，请重新确认"}
+		}
 		if e = gatePackageAction(r.verb, state); e != nil {
 			return asResult(e, "")
 		}

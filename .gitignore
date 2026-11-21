@@ -1,4 +1,5 @@
 # 依赖与可重新生成的构建产物
+/cache/
 node_modules/
 /frontend/dist/
 /build/bin/

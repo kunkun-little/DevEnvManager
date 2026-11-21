@@ -15,7 +15,6 @@ func reparse(st fs.FileInfo) bool                                 { return st.Mo
 func fixedDrive(string) bool                                      { return false }
 func (a *App) DriveStats() []Drive                                { return []Drive{} }
 func regValue(bool, string) (prior, error)                        { return prior{}, onlyWindows }
-func regSet(string, prior) error                                  { return onlyWindows }
 func resolve(string) (string, error)                              { return "", onlyWindows }
 func probe(string, string, time.Duration) (string, string, error) { return "", "", onlyWindows }
 func probePath(string, string, string, time.Duration) (string, string, error) {
@@ -29,3 +28,11 @@ func regSetRaw(string, prior) error { return onlyWindows }
 func notifyEnv()                    {}
 
 func holdConfigLock() (func(), error) { return func() {}, nil }
+
+func copyDirectory(string, string) error        { return onlyWindows }
+func (a *App) openMaintenancePage(string) error { return onlyWindows }
+func registeredVersion(string) string           { return "" }
+
+func probeWithEnv(string, string, string, time.Duration, []string) (string, string, error) {
+	return "", "", onlyWindows
+}

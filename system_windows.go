@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows/registry"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -128,13 +129,6 @@ func regSetRaw(key string, v prior) error {
 	}
 	return nil
 }
-func regSet(key string, v prior) error {
-	if e := regSetRaw(key, v); e != nil {
-		return e
-	}
-	notifyEnv()
-	return nil
-}
 func notifyEnv() {
 
 	txt, _ := syscall.UTF16PtrFromString("Environment")
@@ -165,7 +159,7 @@ func cmdExe() (string, error) {
 }
 func safeEnv(w string) []string {
 	strip := map[string]bool{}
-	for _, k := range []string{"NODE_OPTIONS", "NODE_COMPILE_CACHE", "NODE_V8_COVERAGE", "NODE_REDIRECT_WARNINGS", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "PIP_LOG", "PIP_LOG_FILE", "PIP_DISABLE_PIP_VERSION_CHECK", "GOTOOLCHAIN", "COREPACK_ENABLE_NETWORK", "COREPACK_DEFAULT_TO_LATEST", "COREPACK_ENABLE_AUTO_PIN", "NPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS", "PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS", "NO_COLOR", "NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH", "COREPACK_ENV_FILE"} {
+	for _, k := range []string{"NODE_OPTIONS", "NODE_COMPILE_CACHE", "NODE_V8_COVERAGE", "NODE_REDIRECT_WARNINGS", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "PIP_LOG", "PIP_LOG_FILE", "PIP_DISABLE_PIP_VERSION_CHECK", "GOTOOLCHAIN", "COREPACK_ENABLE_NETWORK", "COREPACK_DEFAULT_TO_LATEST", "COREPACK_ENABLE_AUTO_PIN", "NPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS", "PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS", "NO_COLOR", "NO_DEFAULT_CURRENT_DIRECTORY_IN_EXE_PATH", "COREPACK_ENV_FILE", "NPM_CONFIG_LOGS_MAX", "NPM_CONFIG_UPDATE_NOTIFIER"} {
 		strip[k] = true
 	}
 	var out []string
@@ -175,7 +169,7 @@ func safeEnv(w string) []string {
 			out = append(out, e)
 		}
 	}
-	return append(out, "PYTHONDONTWRITEBYTECODE=1", "PIP_DISABLE_PIP_VERSION_CHECK=1", "GOTOOLCHAIN=local", "COREPACK_ENABLE_NETWORK=0", "COREPACK_DEFAULT_TO_LATEST=0", "COREPACK_ENABLE_AUTO_PIN=0", "COREPACK_ENV_FILE=0", "npm_config_manage_package_manager_versions=false", "PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS=false", "NO_COLOR=1", "NoDefaultCurrentDirectoryInExePath=1")
+	return append(out, "npm_config_logs_max=0", "npm_config_update_notifier=false", "PYTHONDONTWRITEBYTECODE=1", "PIP_DISABLE_PIP_VERSION_CHECK=1", "GOTOOLCHAIN=local", "COREPACK_ENABLE_NETWORK=0", "COREPACK_DEFAULT_TO_LATEST=0", "COREPACK_ENABLE_AUTO_PIN=0", "COREPACK_ENV_FILE=0", "npm_config_manage_package_manager_versions=false", "PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS=false", "NO_COLOR=1", "NoDefaultCurrentDirectoryInExePath=1")
 }
 
 type bounded struct{ b bytes.Buffer }
@@ -202,6 +196,9 @@ func probe(command, w string, t time.Duration) (string, string, error) {
 	return probePath(command, w, path, t)
 }
 func probePath(command, w, path string, t time.Duration) (string, string, error) {
+	return probeWithEnv(command, w, path, t, nil)
+}
+func probeWithEnv(command, w, path string, t time.Duration, overrides []string) (string, string, error) {
 	args := strings.Fields(command)
 	if len(args) < 2 {
 		return "", path, errors.New("无效命令")
@@ -211,7 +208,35 @@ func probePath(command, w, path string, t time.Duration) (string, string, error)
 	defer cancel()
 	c := exec.CommandContext(ctx, path, args[1:]...)
 	c.Dir = w
-	c.Env = safeEnv(w)
+	c.Env = append(safeEnv(w), overrides...)
+	// Keep temporary files from the inspected programs beside this executable.
+	data, err := dataDir(true)
+	if err != nil {
+		return "", path, err
+	}
+	tmp := filepath.Join(data, "Temp")
+	if err = os.MkdirAll(tmp, 0700); err != nil {
+		return "", path, err
+	}
+	if err = rejectNonDirectory(tmp); err != nil {
+		return "", path, err
+	}
+	c.Env = append(c.Env, "TMP="+tmp, "TEMP="+tmp)
+	if args[0] == "go" {
+		// Redirect Go's telemetry while preserving its actual environment file.
+		cfg, err := os.UserConfigDir()
+		if err != nil {
+			return "", path, err
+		}
+		goenv := os.Getenv("GOENV")
+		if goenv == "" {
+			goenv = filepath.Join(cfg, "go", "env")
+		}
+		c.Env = append(c.Env, "APPDATA="+data, "GOENV="+goenv, "TEST_TELEMETRY_DIR="+filepath.Join(data, "GoTelemetry"))
+	}
+	if args[0] == "npm" && (args[1] == "install" || args[1] == "uninstall") {
+		c.Env = append(c.Env, "npm_config_cache="+filepath.Join(data, "npm-cache"))
+	}
 	c.WaitDelay = 1500 * time.Millisecond
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	if strings.EqualFold(filepath.Ext(path), ".cmd") {
@@ -299,4 +324,146 @@ func holdConfigLock() (func(), error) {
 		return nil, errors.New("另一窗口正在写入用户配置，请稍后重试")
 	}
 	return func() { releaseConfigMutex.Call(ptr); _ = syscall.CloseHandle(h); goruntime.UnlockOSThread() }, nil
+}
+
+// Copy into a private staging directory on the destination volume. Publish only
+// complete copies, so a locked file or full disk cannot activate partial data.
+func copyDirectory(src, dst string) (result error) {
+	if _, e := localPath(src); e != nil {
+		return e
+	}
+	if _, e := localPath(dst); e != nil {
+		return e
+	}
+	if overlap(src, dst) {
+		return errors.New("源目录与目标重叠")
+	}
+	if e := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		st, e := d.Info()
+		if e != nil {
+			return e
+		}
+		if reparse(st) || (!st.IsDir() && !st.Mode().IsRegular()) {
+			return fmt.Errorf("存在链接或特殊文件：%s。可选择仅切换配置", p)
+		}
+		return nil
+	}); e != nil {
+		return e
+	}
+	stage, e := os.MkdirTemp(filepath.Dir(dst), ".devenv-copy-")
+	if e != nil {
+		return e
+	}
+	defer func() {
+		// Check the absolute sibling created by this call before removing partial data.
+		if _, e := os.Lstat(stage); os.IsNotExist(e) {
+			return
+		}
+		if _, e := localPath(stage); e == nil && filepath.Dir(stage) == filepath.Dir(dst) && strings.HasPrefix(filepath.Base(stage), ".devenv-copy-") {
+			if e = os.RemoveAll(stage); e != nil {
+				result = fmt.Errorf("迁移临时目录未清理：%s（%v）", stage, e)
+			}
+		}
+	}()
+	sys, e := cmdExe()
+	if e != nil {
+		return e
+	}
+	c := exec.Command(filepath.Join(filepath.Dir(sys), "robocopy.exe"), src, stage, "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:0", "/W:0", "/XJ", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	err := c.Run()
+	if err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return fmt.Errorf("复制未完成：%w", err)
+		}
+	}
+	if _, e = localPath(dst); e != nil {
+		return e
+	}
+	if e = emptyTarget(dst); e != nil {
+		return e
+	}
+	if e = os.Remove(dst); e != nil {
+		return e
+	}
+	if e = os.Rename(stage, dst); e != nil {
+		return e
+	}
+	return nil
+}
+
+func (a *App) openMaintenancePage(target string) error {
+	if target == "ms-settings:appsfeatures" {
+		verb, _ := syscall.UTF16PtrFromString("open")
+		url, _ := syscall.UTF16PtrFromString(target)
+		r, _, _ := syscall.NewLazyDLL("shell32.dll").NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(url)), 0, 0, 1)
+		if r <= 32 {
+			return errors.New("无法打开 Windows 已安装的应用")
+		}
+		return nil
+	}
+	a.ctxMu.RLock()
+	ctx := a.ctx
+	a.ctxMu.RUnlock()
+	if ctx == nil {
+		return errors.New("窗口尚未准备好")
+	}
+	wailsruntime.BrowserOpenURL(ctx, target)
+	return nil
+}
+
+// An installation can remain registered after its PATH entry has been removed.
+// Read only the display metadata. Maintenance still checks the exact package.
+func registeredVersion(id string) string {
+	if id != "node-version" && id != "python-version" && id != "go-version" && id != "pnpm-version" {
+		return ""
+	}
+	latest := ""
+	for _, base := range []registry.Key{registry.CURRENT_USER, registry.LOCAL_MACHINE} {
+		for _, view := range []uint32{registry.WOW64_64KEY, registry.WOW64_32KEY} {
+			root, e := registry.OpenKey(base, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`, registry.ENUMERATE_SUB_KEYS|view)
+			if e != nil {
+				continue
+			}
+			names, _ := root.ReadSubKeyNames(-1)
+			for _, name := range names {
+				key, e := registry.OpenKey(root, name, registry.QUERY_VALUE|view)
+				if e != nil {
+					continue
+				}
+				title, _, _ := key.GetStringValue("DisplayName")
+				version := ""
+				switch id {
+				case "node-version":
+					if strings.EqualFold(title, "Node.js") {
+						version, _, _ = key.GetStringValue("DisplayVersion")
+					}
+				case "pnpm-version":
+					if strings.EqualFold(title, "pnpm") {
+						version, _, _ = key.GetStringValue("DisplayVersion")
+					}
+				case "go-version":
+					if strings.HasPrefix(title, "Go Programming Language ") {
+						version = packageVersion.FindString(title)
+						if version == "" {
+							version, _, _ = key.GetStringValue("DisplayVersion")
+						}
+					}
+				case "python-version":
+					fields := strings.Fields(title)
+					if len(fields) == 3 && fields[0] == "Python" && strings.HasPrefix(fields[2], "(") {
+						version = fields[1]
+					}
+				}
+				key.Close()
+				latest = bestVersion(latest, version)
+			}
+			root.Close()
+		}
+	}
+	return latest
 }

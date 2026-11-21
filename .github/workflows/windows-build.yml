@@ -32,15 +32,15 @@ jobs:
         shell: pwsh
         run: |
           $files = @('dist/DevEnvManager.exe', 'README.md', 'TEST-REPORT.md', 'licenses')
-          Compress-Archive -Path $files -DestinationPath 'dist/DevEnvManager-0.3.0-windows-x64.zip'
-          $paths = @('dist/DevEnvManager.exe', 'dist/DevEnvManager-0.3.0-windows-x64.zip')
+          Compress-Archive -Path $files -DestinationPath 'dist/DevEnvManager-0.4.1-windows-x64.zip'
+          $paths = @('dist/DevEnvManager.exe', 'dist/DevEnvManager-0.4.1-windows-x64.zip')
           $paths | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $_)
-          } | Set-Content -Encoding ascii dist/DevEnvManager-0.3.0-SHA256.txt
+          } | Set-Content -Encoding ascii dist/DevEnvManager-0.4.1-SHA256.txt
       - uses: actions/upload-artifact@v4
         with:
           name: DevEnvManager-Windows-x64
           path: |
-            dist/DevEnvManager-0.3.0-windows-x64.zip
-            dist/DevEnvManager-0.3.0-SHA256.txt
+            dist/DevEnvManager-0.4.1-windows-x64.zip
+            dist/DevEnvManager-0.4.1-SHA256.txt
           if-no-files-found: error
